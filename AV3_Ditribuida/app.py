@@ -2,6 +2,7 @@ import http.server
 import socketserver
 import urllib.request
 import threading
+import random
 from datetime import datetime
 
 PORTA_BALANCEADOR = 3100
@@ -13,7 +14,6 @@ SERVIDORES_DESTINO = [
      "ativo": True}
 ]
 
-indice_atual = 0
 total_geral_requisicoes = 0
 historico_logs = []
 lock = threading.Lock()
@@ -51,7 +51,7 @@ class ServidorDestinoHandler(http.server.SimpleHTTPRequestHandler):
 def iniciar_servidor_destino(info):
     socketserver.TCPServer.allow_reuse_address = True
     with socketserver.TCPServer((info["host"], info["porta"]), ServidorDestinoHandler) as httpd:
-        print(f"-> {info['nome']} ativo em http://{info['host']}:{info['porta']}")
+        print(f" {info['nome']} ativo em http://{info['host']}:{info['porta']}")
         httpd.serve_forever()
 
 
@@ -60,8 +60,6 @@ class LoadBalancerHandler(http.server.SimpleHTTPRequestHandler):
         pass
 
     def do_GET(self):
-        global indice_atual
-
         if self.path == "/favicon.ico":
             self.send_response(404)
             self.end_headers()
@@ -81,27 +79,44 @@ class LoadBalancerHandler(http.server.SimpleHTTPRequestHandler):
             horario_envio = datetime.now().strftime("%H:%M:%S.%f")[:-3]
             sucesso = False
 
-            for _ in range(len(SERVIDORES_DESTINO)):
-                with lock:
-                    servidor_escolhido = SERVIDORES_DESTINO[indice_atual]
-                    indice_atual = (indice_atual + 1) % len(SERVIDORES_DESTINO)
+            with lock:
+                servidores_ativos = [s for s in SERVIDORES_DESTINO if s["ativo"]]
 
-                if not servidor_escolhido["ativo"]:
-                    with lock:
-                        historico_logs.insert(0,
-                                              f"[{horario_envio}] 🔴 FALHA: {servidor_escolhido['nome']} está OFFLINE! Tentando próximo...")
-                    continue
+            if len(servidores_ativos) == 2:
+                srv_a, srv_b = servidores_ativos[0], servidores_ativos[1]
+                req_a, req_b = srv_a["requisicoes"], srv_b["requisicoes"]
+                total_reqs = req_a + req_b
 
+                if total_reqs == 0:
+                    servidor_escolhido = random.choice(servidores_ativos)
+                else:
+
+                    peso_a = 1.0 - (req_a / total_reqs)
+                    peso_b = 1.0 - (req_b / total_reqs)
+
+
+                    servidor_escolhido = random.choices([srv_a, srv_b], weights=[peso_a, peso_b], k=1)[0]
+
+            elif len(servidores_ativos) == 1:
+
+                servidor_escolhido = servidores_ativos[0]
+            else:
+                servidor_escolhido = None
+
+            if servidor_escolhido:
                 try:
                     url_destino = f"http://{servidor_escolhido['host']}:{servidor_escolhido['porta']}{self.path}"
                     with urllib.request.urlopen(url_destino, timeout=0.5) as resp:
                         if resp.getcode() == 200:
                             sucesso = True
-                            break
                 except Exception:
                     with lock:
                         historico_logs.insert(0,
                                               f"[{horario_envio}] 🔴 ERRO: Falha ao conectar em {servidor_escolhido['nome']}.")
+            else:
+                with lock:
+                    historico_logs.insert(0, f"[{horario_envio}] 🔴 FALHA: Todos os servidores estão OFFLINE!")
+
             if sucesso:
                 self.send_response(200)
                 self.send_header("Content-Type", "text/plain")
@@ -111,9 +126,11 @@ class LoadBalancerHandler(http.server.SimpleHTTPRequestHandler):
                 self.send_response(502)
                 self.send_header("Content-Type", "text/plain; charset=utf-8")
                 self.end_headers()
-                self.wfile.write(b"CORRUPTO: Nenhum servidor disponivel no cluster!")
+                msg_erro = "CORRUPTO: Nenhum servidor disponível no cluster!"
+                self.wfile.write(msg_erro.encode("utf-8"))
             return
 
+        # ROTA PRINCIPAL: DASHBOARD HTML
         total = total_geral_requisicoes if total_geral_requisicoes > 0 else 1
         porcentagem_a = (SERVIDORES_DESTINO[0]["requisicoes"] / total) * 100
         porcentagem_b = (SERVIDORES_DESTINO[1]["requisicoes"] / total) * 100
@@ -126,7 +143,7 @@ class LoadBalancerHandler(http.server.SimpleHTTPRequestHandler):
         <html>
         <head>
             <meta charset="UTF-8">
-            <title>Load Balancer</title>
+            <title>Load Balancer Dinâmico Proporcional</title>
             <style>
                 body {{ font-family: sans-serif; background: #121214; color: #fff; padding: 20px; }}
                 .container {{ max-width: 800px; margin: 0 auto; text-align: center; }}
@@ -135,8 +152,6 @@ class LoadBalancerHandler(http.server.SimpleHTTPRequestHandler):
                 .btn {{ background: #e74c3c; color: #fff; border: none; padding: 10px 20px; font-weight: bold; cursor: pointer; border-radius: 5px; }}
                 .btn-toggle {{ background: #555; color: #fff; border: none; padding: 6px 12px; cursor: pointer; border-radius: 4px; }}
                 .console {{ background: #0c0c0e; padding: 15px; text-align: left; font-family: monospace; border-radius: 6px; max-height: 250px; overflow-y: auto; }}
-
-                /* Caixa de Alerta de Erro Crítico */
                 .alert-danger {{ display: none; background: #5a1919; color: #ff9999; padding: 15px; border: 2px solid #e74c3c; border-radius: 6px; margin-bottom: 20px; font-weight: bold; font-size: 1.1rem; }}
             </style>
             <script>
@@ -144,7 +159,6 @@ class LoadBalancerHandler(http.server.SimpleHTTPRequestHandler):
                     document.getElementById('erro-painel').style.display = 'none';
                     let falhou = false;
 
-                    // Dispara as requisições monitorando o status HTTP retornado
                     for(let i=0; i<20; i++) {{
                         try {{
                             let resposta = await fetch('/simulacao-' + i + '?t=' + Date.now());
@@ -156,10 +170,8 @@ class LoadBalancerHandler(http.server.SimpleHTTPRequestHandler):
                         }}
                     }}
 
-                    // Se o balanceador respondeu com 502, exibe o erro na tela em vez de atualizar limpo
                     if (falhou) {{
                         document.getElementById('erro-painel').style.display = 'block';
-                        // Atualiza apenas a caixa de logs para mostrar as linhas vermelhas
                         setTimeout(() => {{ location.reload(); }}, 3000); 
                     }} else {{
                         location.reload();
@@ -170,6 +182,7 @@ class LoadBalancerHandler(http.server.SimpleHTTPRequestHandler):
         <body>
             <div class="container">
                 <h1>Balanceador de Carga HTTP</h1>
+                <h3>Algoritmo: Balanceamento Proporcional por Compensação</h3>
 
                 <div id="erro-painel" class="alert-danger">
                     🚨 ERRO 502: BAD GATEWAY!<br>
@@ -182,12 +195,12 @@ class LoadBalancerHandler(http.server.SimpleHTTPRequestHandler):
                 <div class="grid">
                     <div class="card" style="border-color: {SERVIDORES_DESTINO[0]['cor']}; opacity: {1 if SERVIDORES_DESTINO[0]['ativo'] else 0.4};">
                         <h3>{SERVIDORES_DESTINO[0]['nome']} ({'🟢 ON' if SERVIDORES_DESTINO[0]['ativo'] else '🔴 OFF'})</h3>
-                        <p>Porta: 3101 | Requisições: <strong>{SERVIDORES_DESTINO[0]['requisicoes']}</strong> ({porcentagem_a:.1f}%)</p>
+                        <p>Porta: 3101 | Requisições Processadas: <strong>{SERVIDORES_DESTINO[0]['requisicoes']}</strong> ({porcentagem_a:.1f}%)</p>
                         <button class="btn-toggle" onclick="location.href='/alternar/3101'">Derrubar / Ligar</button>
                     </div>
                     <div class="card" style="border-color: {SERVIDORES_DESTINO[1]['cor']}; opacity: {1 if SERVIDORES_DESTINO[1]['ativo'] else 0.4};">
                         <h3>{SERVIDORES_DESTINO[1]['nome']} ({'🟢 ON' if SERVIDORES_DESTINO[1]['ativo'] else '🔴 OFF'})</h3>
-                        <p>Porta: 3102 | Requisições: <strong>{SERVIDORES_DESTINO[1]['requisicoes']}</strong> ({porcentagem_b:.1f}%)</p>
+                        <p>Porta: 3102 | Requisições Processadas: <strong>{SERVIDORES_DESTINO[1]['requisicoes']}</strong> ({porcentagem_b:.1f}%)</p>
                         <button class="btn-toggle" onclick="location.href='/alternar/3102'">Derrubar / Ligar</button>
                     </div>
                 </div>
@@ -209,7 +222,7 @@ class LoadBalancerHandler(http.server.SimpleHTTPRequestHandler):
 def iniciar():
     socketserver.TCPServer.allow_reuse_address = True
     with socketserver.TCPServer(("127.0.0.1", PORTA_BALANCEADOR), LoadBalancerHandler) as httpd:
-        print(f"== BALANCEADOR ONLINE EM: http://127.0.0.1:{PORTA_BALANCEADOR} ==")
+        print(f" BALANCEADOR ONLINE EM: http://127.0.0.1:{PORTA_BALANCEADOR} ")
         httpd.serve_forever()
 
 
