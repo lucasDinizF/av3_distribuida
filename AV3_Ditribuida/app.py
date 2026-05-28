@@ -4,11 +4,13 @@ import urllib.request
 import threading
 from datetime import datetime
 
-PORTA_BALANCEADOR = 3000
+PORTA_BALANCEADOR = 3100
 
 SERVIDORES_DESTINO = [
-    {"host": "127.0.0.1", "porta": 3001, "nome": "Servidor Principal A", "cor": "#3498db", "requisicoes": 0},
-    {"host": "127.0.0.1", "porta": 3002, "nome": "Servidor Reserva B", "cor": "#2ecc71", "requisicoes": 0}
+    {"host": "127.0.0.1", "porta": 3101, "nome": "Servidor Principal A", "cor": "#3498db", "requisicoes": 0,
+     "ativo": True},
+    {"host": "127.0.0.1", "porta": 3102, "nome": "Servidor Reserva B", "cor": "#2ecc71", "requisicoes": 0,
+     "ativo": True}
 ]
 
 indice_atual = 0
@@ -23,33 +25,35 @@ class ServidorDestinoHandler(http.server.SimpleHTTPRequestHandler):
 
     def do_GET(self):
         porta_atual = self.server.server_address[1]
-        servidor = next(s for s in SERVIDORES_DESTINO if s["porta"] == porta_atual)
+        servidor = next((s for s in SERVIDORES_DESTINO if s["porta"] == porta_atual), None)
+
+        if servidor and not servidor["ativo"]:
+            self.send_response(503)
+            self.end_headers()
+            return
 
         with lock:
-            servidor["requisicoes"] += 1
-            contagem_individual = servidor["requisicoes"]
+            if servidor:
+                servidor["requisicoes"] += 1
+                contagem = servidor["requisicoes"]
             global total_geral_requisicoes
             total_geral_requisicoes += 1
-
             horario = datetime.now().strftime("%H:%M:%S.%f")[:-3]
-            log_msg = f"[{horario}] 🟢 {servidor['nome']} (Porta {porta_atual}) processou a requisição nº {contagem_individual}."
-            historico_logs.insert(0, log_msg)
+            historico_logs.insert(0,
+                                  f"[{horario}] 🟢 {servidor['nome']} (Porta {porta_atual}) processou a requisição nº {contagem}.")
 
-        conteudo_resposta = b"OK"
         self.send_response(200)
-        self.send_header("Content-Type", "text/plain; charset=utf-8")
-
-        self.send_header("Content-Length", str(len(conteudo_resposta)))
+        self.send_header("Content-Type", "text/plain")
         self.end_headers()
+        self.wfile.write(b"OK")
 
-        self.wfile.write(conteudo_resposta)
 
-
-def iniciar_servidor_destino(info_servidor):
-    handler = ServidorDestinoHandler
-    with socketserver.TCPServer((info_servidor["host"], info_servidor["porta"]), handler) as httpd:
-        print(f"-> {info_servidor['nome']} ativo em http://{info_servidor['host']}:{info_servidor['porta']}")
+def iniciar_servidor_destino(info):
+    socketserver.TCPServer.allow_reuse_address = True
+    with socketserver.TCPServer((info["host"], info["porta"]), ServidorDestinoHandler) as httpd:
+        print(f"-> {info['nome']} ativo em http://{info['host']}:{info['porta']}")
         httpd.serve_forever()
+
 
 class LoadBalancerHandler(http.server.SimpleHTTPRequestHandler):
     def log_message(self, format, *args):
@@ -63,133 +67,153 @@ class LoadBalancerHandler(http.server.SimpleHTTPRequestHandler):
             self.end_headers()
             return
 
-        with lock:
-            servidor_escolhido = SERVIDORES_DESTINO[indice_atual]
-            indice_atual = (indice_atual + 1) % len(SERVIDORES_DESTINO)
+        if self.path.startswith("/alternar/"):
+            porta_alvo = int(self.path.split("/")[-1])
+            for s in SERVIDORES_DESTINO:
+                if s["porta"] == porta_alvo:
+                    s["ativo"] = not s["ativo"]
+            self.send_response(303)
+            self.send_header("Location", "/")
+            self.end_headers()
+            return
 
-        horario_envio = datetime.now().strftime("%H:%M:%S.%f")[:-3]
+        if self.path.startswith("/simulacao-"):
+            horario_envio = datetime.now().strftime("%H:%M:%S.%f")[:-3]
+            sucesso = False
 
-        url_destino = f"http://{servidor_escolhido['host']}:{servidor_escolhido['porta']}{self.path}"
+            for _ in range(len(SERVIDORES_DESTINO)):
+                with lock:
+                    servidor_escolhido = SERVIDORES_DESTINO[indice_atual]
+                    indice_atual = (indice_atual + 1) % len(SERVIDORES_DESTINO)
 
-        try:
-            with urllib.request.urlopen(url_destino, timeout=2) as resposta_servidor:
-                resposta_servidor.read()
-        except Exception as e:
-            with lock:
-                historico_logs.insert(0,
-                                      f"[{horario_envio}] 🔴 ERRO: Falha ao conectar com {servidor_escolhido['nome']}.")
+                if not servidor_escolhido["ativo"]:
+                    with lock:
+                        historico_logs.insert(0,
+                                              f"[{horario_envio}] 🔴 FALHA: {servidor_escolhido['nome']} está OFFLINE! Tentando próximo...")
+                    continue
+
+                try:
+                    url_destino = f"http://{servidor_escolhido['host']}:{servidor_escolhido['porta']}{self.path}"
+                    with urllib.request.urlopen(url_destino, timeout=0.5) as resp:
+                        if resp.getcode() == 200:
+                            sucesso = True
+                            break
+                except Exception:
+                    with lock:
+                        historico_logs.insert(0,
+                                              f"[{horario_envio}] 🔴 ERRO: Falha ao conectar em {servidor_escolhido['nome']}.")
+            if sucesso:
+                self.send_response(200)
+                self.send_header("Content-Type", "text/plain")
+                self.end_headers()
+                self.wfile.write(b"OK")
+            else:
+                self.send_response(502)
+                self.send_header("Content-Type", "text/plain; charset=utf-8")
+                self.end_headers()
+                self.wfile.write(b"CORRUPTO: Nenhum servidor disponivel no cluster!")
+            return
 
         total = total_geral_requisicoes if total_geral_requisicoes > 0 else 1
         porcentagem_a = (SERVIDORES_DESTINO[0]["requisicoes"] / total) * 100
         porcentagem_b = (SERVIDORES_DESTINO[1]["requisicoes"] / total) * 100
 
-        logs_html = "".join([f"<div class='log-line'>{log}</div>" for log in historico_logs[:12]])
+        logs_html = "".join(
+            [f"<div style='padding:5px 0; border-bottom:1px solid #222;'>{log}</div>" for log in historico_logs[:12]])
 
-        html_dashboard = f"""
+        html = f"""
         <!DOCTYPE html>
-        <html lang="pt-BR">
+        <html>
         <head>
             <meta charset="UTF-8">
-            <title>Painel de Controle - Balanceamento de Carga</title>
+            <title>Load Balancer</title>
             <style>
-                body {{ font-family: 'Segoe UI', Arial, sans-serif; background: #13131a; color: #fff; margin: 0; padding: 20px; }}
-                .container {{ max-width: 900px; margin: 0 auto; }}
-                header {{ text-align: center; margin-bottom: 25px; border-bottom: 2px solid #1f1f2e; padding-bottom: 20px; }}
-                h1 {{ margin: 0; color: #f1c40f; font-size: 2.2rem; }}
-                p {{ color: #8f8fbf; margin: 5px 0 15px 0; }}
+                body {{ font-family: sans-serif; background: #121214; color: #fff; padding: 20px; }}
+                .container {{ max-width: 800px; margin: 0 auto; text-align: center; }}
+                .grid {{ display: grid; grid-template-columns: 1fr 1fr; gap: 20px; margin: 20px 0; }}
+                .card {{ background: #202024; padding: 20px; border-radius: 8px; border-top: 6px solid; text-align: left; }}
+                .btn {{ background: #e74c3c; color: #fff; border: none; padding: 10px 20px; font-weight: bold; cursor: pointer; border-radius: 5px; }}
+                .btn-toggle {{ background: #555; color: #fff; border: none; padding: 6px 12px; cursor: pointer; border-radius: 4px; }}
+                .console {{ background: #0c0c0e; padding: 15px; text-align: left; font-family: monospace; border-radius: 6px; max-height: 250px; overflow-y: auto; }}
 
-                .btn-stress {{ background: #e74c3c; color: white; border: none; padding: 12px 24px; font-size: 1.1rem; font-weight: bold; border-radius: 8px; cursor: pointer; transition: background 0.2s; box-shadow: 0 4px 15px rgba(231, 76, 60, 0.3); }}
-                .btn-stress:hover {{ background: #c0392b; }}
-
-                .total-badge {{ background: #1f1f2e; padding: 8px 20px; border-radius: 20px; display: inline-block; margin-top: 15px; font-weight: bold; font-size: 1.2rem; border: 1px solid #2a2a40; }}
-
-                .grid {{ display: grid; grid-template-columns: 1fr 1fr; gap: 20px; margin-bottom: 25px; }}
-                .card {{ background: #1f1f2e; padding: 25px; border-radius: 12px; border-top: 8px solid #fff; border: 1px solid #2a2a40; }}
-                .card.srv-a {{ border-top: 8px solid {SERVIDORES_DESTINO[0]['cor']}; }}
-                .card.srv-b {{ border-top: 8px solid {SERVIDORES_DESTINO[1]['cor']}; }}
-                .card h2 {{ margin: 0 0 15px 0; font-size: 1.4rem; color: #f5f5f5; }}
-
-                .progress-bar {{ background: #111116; border-radius: 10px; height: 30px; width: 100%; margin-top: 15px; overflow: hidden; border: 1px solid #2a2a40; }}
-                .progress-fill {{ height: 100%; transition: width 0.3s ease; display: flex; align-items: center; justify-content: flex-end; padding-right: 12px; font-weight: bold; font-size: 0.95rem; color: #fff; }}
-                .fill-a {{ width: {porcentagem_a}%; background: {SERVIDORES_DESTINO[0]['cor']}; }}
-                .fill-b {{ width: {porcentagem_b}%; background: {SERVIDORES_DESTINO[1]['cor']}; }}
-
-                .console {{ background: #0c0c10; border-radius: 12px; padding: 20px; font-family: 'Consolas', monospace; border: 1px solid #1f1f2e; }}
-                .console h3 {{ margin: 0 0 15px 0; color: #8f8fbf; border-bottom: 1px solid #1f1f2e; padding-bottom: 8px; }}
-                .log-line {{ padding: 6px 0; border-bottom: 1px solid #111116; font-size: 0.95rem; color: #2ecc71; }}
-                .log-line:first-child {{ font-weight: bold; color: #fff; background: rgba(255,255,255,0.05); }}
+                /* Caixa de Alerta de Erro Crítico */
+                .alert-danger {{ display: none; background: #5a1919; color: #ff9999; padding: 15px; border: 2px solid #e74c3c; border-radius: 6px; margin-bottom: 20px; font-weight: bold; font-size: 1.1rem; }}
             </style>
             <script>
-                // Função mágica que envia 20 requisições assíncronas em lote para o balanceador
-                function dispararCarga() {{
-                    let promessas = [];
+                async function testar() {{
+                    document.getElementById('erro-painel').style.display = 'none';
+                    let falhou = false;
+
+                    // Dispara as requisições monitorando o status HTTP retornado
                     for(let i=0; i<20; i++) {{
-                        promessas.push(fetch('/simulacao-' + i));
+                        try {{
+                            let resposta = await fetch('/simulacao-' + i + '?t=' + Date.now());
+                            if (resposta.status === 502) {{
+                                falhou = true;
+                            }}
+                        }} catch (e) {{
+                            falhou = true;
+                        }}
                     }}
-                    // Espera todas terminarem e recarrega a tela para computar os dados de uma vez
-                    Promise.all(promessas).then(() => {{
-                        window.location.reload();
-                    }});
+
+                    // Se o balanceador respondeu com 502, exibe o erro na tela em vez de atualizar limpo
+                    if (falhou) {{
+                        document.getElementById('erro-painel').style.display = 'block';
+                        // Atualiza apenas a caixa de logs para mostrar as linhas vermelhas
+                        setTimeout(() => {{ location.reload(); }}, 3000); 
+                    }} else {{
+                        location.reload();
+                    }}
                 }}
             </script>
         </head>
         <body>
             <div class="container">
-                <header>
-                    <h1>Dashboard de Arquitetura Distribuída</h1>
-                    <p>Mecanismo de Proxy Reverso rodando em Algoritmo Round Robin</p>
+                <h1>Balanceador de Carga HTTP</h1>
 
-                    <button class="btn-stress" onclick="dispararCarga()">🚀 Simular Enxurrada de Requisições (Stress Test)</button>
-                    <br>
-                    <div class="total-badge">📊 Volume Total Processado no Cluster: {total_geral_requisicoes}</div>
-                </header>
+                <div id="erro-painel" class="alert-danger">
+                    🚨 ERRO 502: BAD GATEWAY!<br>
+                    O sistema tentou escoar o tráfego, mas todos os servidores do cluster estão caídos!
+                </div>
+
+                <button class="btn" onclick="testar()">🚀 Simular 20 Requisições</button>
+                <p>Volume Total: <strong>{total_geral_requisicoes}</strong></p>
 
                 <div class="grid">
-                    <div class="card srv-a">
-                        <h2>🖥️ {SERVIDORES_DESTINO[0]['nome']}</h2>
-                        <p style="color:#aaa; margin:0;">Endereço de Rede: <code>127.0.0.1:3001</code></p>
-                        <p style="margin:10px 0 0 0;">Requisições Aceitas: <strong style="font-size:1.2rem; color:{SERVIDORES_DESTINO[0]['cor']};">{SERVIDORES_DESTINO[0]['requisicoes']}</strong></p>
-                        <div class="progress-bar">
-                            <div class="progress-fill fill-a">{porcentagem_a:.1f}%</div>
-                        </div>
+                    <div class="card" style="border-color: {SERVIDORES_DESTINO[0]['cor']}; opacity: {1 if SERVIDORES_DESTINO[0]['ativo'] else 0.4};">
+                        <h3>{SERVIDORES_DESTINO[0]['nome']} ({'🟢 ON' if SERVIDORES_DESTINO[0]['ativo'] else '🔴 OFF'})</h3>
+                        <p>Porta: 3101 | Requisições: <strong>{SERVIDORES_DESTINO[0]['requisicoes']}</strong> ({porcentagem_a:.1f}%)</p>
+                        <button class="btn-toggle" onclick="location.href='/alternar/3101'">Derrubar / Ligar</button>
                     </div>
-
-                    <div class="card srv-b">
-                        <h2>🖥️ {SERVIDORES_DESTINO[1]['nome']}</h2>
-                        <p style="color:#aaa; margin:0;">Endereço de Rede: <code>127.0.0.1:3002</code></p>
-                        <p style="margin:10px 0 0 0;">Requisições Aceitas: <strong style="font-size:1.2rem; color:{SERVIDORES_DESTINO[1]['cor']};">{SERVIDORES_DESTINO[1]['requisicoes']}</strong></p>
-                        <div class="progress-bar">
-                            <div class="progress-fill fill-b">{porcentagem_b:.1f}%</div>
-                        </div>
+                    <div class="card" style="border-color: {SERVIDORES_DESTINO[1]['cor']}; opacity: {1 if SERVIDORES_DESTINO[1]['ativo'] else 0.4};">
+                        <h3>{SERVIDORES_DESTINO[1]['nome']} ({'🟢 ON' if SERVIDORES_DESTINO[1]['ativo'] else '🔴 OFF'})</h3>
+                        <p>Porta: 3102 | Requisições: <strong>{SERVIDORES_DESTINO[1]['requisicoes']}</strong> ({porcentagem_b:.1f}%)</p>
+                        <button class="btn-toggle" onclick="location.href='/alternar/3102'">Derrubar / Ligar</button>
                     </div>
                 </div>
 
                 <div class="console">
-                    <h3>📟 Histórico de Distribuição de Tráfego HTTP</h3>
-                    {logs_html if total_geral_requisicoes > 0 else "<div style='color:#555'>Nenhuma requisição recebida ainda. Clique no botão acima para iniciar.</div>"}
+                    <h4>📟 Logs do Cluster:</h4>
+                    {logs_html if historico_logs else "Nenhum evento registrado ainda."}
                 </div>
             </div>
         </body>
         </html>
         """
-
         self.send_response(200)
         self.send_header("Content-Type", "text/html; charset=utf-8")
         self.end_headers()
-        self.wfile.write(html_dashboard.encode("utf-8"))
+        self.wfile.write(html.encode("utf-8"))
 
 
-def iniciar_balanceador():
+def iniciar():
+    socketserver.TCPServer.allow_reuse_address = True
     with socketserver.TCPServer(("127.0.0.1", PORTA_BALANCEADOR), LoadBalancerHandler) as httpd:
-        print("====================================================")
-        print(f" BALANCEADOR ATIVO EM -> http://127.0.0.1:{PORTA_BALANCEADOR}")
-        print("====================================================")
+        print(f"== BALANCEADOR ONLINE EM: http://127.0.0.1:{PORTA_BALANCEADOR} ==")
         httpd.serve_forever()
 
 
 if __name__ == "__main__":
     for s in SERVIDORES_DESTINO:
-        t = threading.Thread(target=iniciar_servidor_destino, args=(s,), daemon=True)
-        t.start()
-
-    iniciar_balanceador()
+        threading.Thread(target=iniciar_servidor_destino, args=(s,), daemon=True).start()
+    iniciar()
