@@ -51,7 +51,6 @@ class ServidorDestinoHandler(http.server.SimpleHTTPRequestHandler):
 def iniciar_servidor_destino(info):
     socketserver.TCPServer.allow_reuse_address = True
     with socketserver.TCPServer((info["host"], info["porta"]), ServidorDestinoHandler) as httpd:
-        print(f" {info['nome']} ativo em http://{info['host']}:{info['porta']}")
         httpd.serve_forever()
 
 
@@ -90,15 +89,11 @@ class LoadBalancerHandler(http.server.SimpleHTTPRequestHandler):
                 if total_reqs == 0:
                     servidor_escolhido = random.choice(servidores_ativos)
                 else:
-
                     peso_a = 1.0 - (req_a / total_reqs)
                     peso_b = 1.0 - (req_b / total_reqs)
-
-
                     servidor_escolhido = random.choices([srv_a, srv_b], weights=[peso_a, peso_b], k=1)[0]
 
             elif len(servidores_ativos) == 1:
-
                 servidor_escolhido = servidores_ativos[0]
             else:
                 servidor_escolhido = None
@@ -222,11 +217,17 @@ class LoadBalancerHandler(http.server.SimpleHTTPRequestHandler):
 def iniciar():
     socketserver.TCPServer.allow_reuse_address = True
     with socketserver.TCPServer(("127.0.0.1", PORTA_BALANCEADOR), LoadBalancerHandler) as httpd:
-        print(f" BALANCEADOR ONLINE EM: http://127.0.0.1:{PORTA_BALANCEADOR} ")
         httpd.serve_forever()
 
 
 if __name__ == "__main__":
+    print(f"BALANCEADOR ONLINE EM: http://127.0.0.1:{PORTA_BALANCEADOR}")
+    for s in SERVIDORES_DESTINO:
+        print(f"{s['nome']} ativo em http://{s['host']}:{s['porta']}")
+
+    print("-" * 60)
+
     for s in SERVIDORES_DESTINO:
         threading.Thread(target=iniciar_servidor_destino, args=(s,), daemon=True).start()
+
     iniciar()
